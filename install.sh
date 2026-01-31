@@ -9,11 +9,22 @@ CUSTOM_TARBALL="${GH_MIRROR_TARBALL:-}"
 INSTALL_ROOT="${GH_MIRROR_HOME:-$HOME/.gh-mirror}"
 BIN_DIR="${GH_MIRROR_BIN:-$HOME/.local/bin}"
 
+# Check if running from inside the repo (local install)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USE_LOCAL=false
+if [[ -f "$SCRIPT_DIR/bin/ghmirror" && -d "$SCRIPT_DIR/scripts" ]]; then
+  USE_LOCAL=true
+fi
+
 echo "ghmirror installer"
-if [[ -n "$CUSTOM_TARBALL" ]]; then
-  echo "Source repository : $REPO_URL (custom tarball)"
+if [[ "$USE_LOCAL" == "true" ]]; then
+  echo "Source            : local ($SCRIPT_DIR)"
 else
-  echo "Source repository : $REPO_URL (@ $REPO_REF)"
+  if [[ -n "$CUSTOM_TARBALL" ]]; then
+    echo "Source repository : $REPO_URL (custom tarball)"
+  else
+    echo "Source repository : $REPO_URL (@ $REPO_REF)"
+  fi
 fi
 echo "Install location  : $INSTALL_ROOT"
 echo "Binary directory  : $BIN_DIR"
@@ -21,53 +32,59 @@ echo "Binary directory  : $BIN_DIR"
 mkdir -p "$INSTALL_ROOT"
 mkdir -p "$BIN_DIR"
 
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-download_and_extract() {
-  local ref="$1" url="$2"
-  rm -rf "$TMP_DIR"/*
-  echo "Downloading sources from $url"
-  if curl -fsSL "$url" -o "$TMP_DIR/source.tar.gz"; then
-    tar -xz -C "$TMP_DIR" -f "$TMP_DIR/source.tar.gz"
-    local extracted
-    extracted="$(find "$TMP_DIR" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n1)"
-    if [[ -n "$extracted" ]]; then
-      SRC_DIR="$extracted"
-      REPO_REF="$ref"
-      return 0
-    fi
-  fi
-  return 1
-}
-
 SRC_DIR=""
 
-if [[ -n "$CUSTOM_TARBALL" ]]; then
-  if ! download_and_extract "$REPO_REF" "$CUSTOM_TARBALL"; then
-    echo "Error: failed to download custom tarball $CUSTOM_TARBALL" >&2
-    exit 1
-  fi
+if [[ "$USE_LOCAL" == "true" ]]; then
+  # Use local repo directly
+  SRC_DIR="$SCRIPT_DIR"
 else
-  refs_to_try=("$REPO_REF")
-  if [[ "$REPO_REF" != "main" ]]; then
-    refs_to_try+=("main")
-  fi
-  if [[ "$REPO_REF" != "master" ]]; then
-    refs_to_try+=("master")
-  fi
+  # Download from remote
+  TMP_DIR="$(mktemp -d)"
+  trap 'rm -rf "$TMP_DIR"' EXIT
 
-  for ref in "${refs_to_try[@]}"; do
-    if download_and_extract "$ref" "${REPO_URL}/archive/refs/heads/${ref}.tar.gz"; then
-      break
-    else
-      echo "Warning: could not download ref '$ref' from ${REPO_URL}."
+  download_and_extract() {
+    local ref="$1" url="$2"
+    rm -rf "$TMP_DIR"/*
+    echo "Downloading sources from $url"
+    if curl -fsSL "$url" -o "$TMP_DIR/source.tar.gz"; then
+      tar -xz -C "$TMP_DIR" -f "$TMP_DIR/source.tar.gz"
+      local extracted
+      extracted="$(find "$TMP_DIR" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n1)"
+      if [[ -n "$extracted" ]]; then
+        SRC_DIR="$extracted"
+        REPO_REF="$ref"
+        return 0
+      fi
     fi
-  done
+    return 1
+  }
 
-  if [[ -z "$SRC_DIR" ]]; then
-    echo "Error: unable to download repository tarball from $REPO_URL (tried refs: ${refs_to_try[*]})." >&2
-    exit 1
+  if [[ -n "$CUSTOM_TARBALL" ]]; then
+    if ! download_and_extract "$REPO_REF" "$CUSTOM_TARBALL"; then
+      echo "Error: failed to download custom tarball $CUSTOM_TARBALL" >&2
+      exit 1
+    fi
+  else
+    refs_to_try=("$REPO_REF")
+    if [[ "$REPO_REF" != "main" ]]; then
+      refs_to_try+=("main")
+    fi
+    if [[ "$REPO_REF" != "master" ]]; then
+      refs_to_try+=("master")
+    fi
+
+    for ref in "${refs_to_try[@]}"; do
+      if download_and_extract "$ref" "${REPO_URL}/archive/refs/heads/${ref}.tar.gz"; then
+        break
+      else
+        echo "Warning: could not download ref '$ref' from ${REPO_URL}."
+      fi
+    done
+
+    if [[ -z "$SRC_DIR" ]]; then
+      echo "Error: unable to download repository tarball from $REPO_URL (tried refs: ${refs_to_try[*]})." >&2
+      exit 1
+    fi
   fi
 fi
 

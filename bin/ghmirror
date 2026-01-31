@@ -31,6 +31,12 @@ SCRIPTS_DIR="$(find_scripts_dir)" || SCRIPTS_DIR=""
 CONFIGURE_SCRIPT="$SCRIPTS_DIR/configure-gh-env.sh"
 WORKFLOW_SCRIPT="$SCRIPTS_DIR/setup-gha.sh"
 GITLAB_SETUP_SCRIPT="$SCRIPTS_DIR/setup-gitlab-project.sh"
+KEYCHAIN_SCRIPT="$SCRIPTS_DIR/keychain.sh"
+
+# Source keychain helpers if available
+if [[ -f "$KEYCHAIN_SCRIPT" ]]; then
+  source "$KEYCHAIN_SCRIPT"
+fi
 
 # Global options
 AUTO_MODE=false
@@ -38,6 +44,17 @@ GITLAB_TOKEN="${GITLAB_TOKEN:-}"
 GITLAB_NAMESPACE="${GITLAB_NAMESPACE:-}"
 GITLAB_HOST="${GITLAB_HOST:-gitlab.com}"
 MIRROR_ALL_BRANCHES=true
+
+# Try to load token from keychain if not set
+load_token_from_keychain() {
+  if [[ -z "$GITLAB_TOKEN" ]] && type keychain_get &>/dev/null; then
+    local stored_token
+    if stored_token="$(keychain_get "$GITLAB_HOST" 2>/dev/null)" && [[ -n "$stored_token" ]]; then
+      GITLAB_TOKEN="$stored_token"
+      echo "Using GitLab token from keychain"
+    fi
+  fi
+}
 
 print_help() {
   cat <<'EOF'
@@ -125,17 +142,15 @@ ensure_gh_cli() {
 
 # Get GitHub repo info
 get_github_info() {
-  local json
-  json=$(gh repo view --json name,owner,description,visibility,defaultBranchRef 2>/dev/null) || {
+  # Use gh CLI's built-in query feature for reliable parsing
+  GITHUB_REPO_NAME=$(gh repo view --json name -q '.name' 2>/dev/null) || {
     echo "Error: Could not get GitHub repository info. Are you in a GitHub repo?" >&2
     return 1
   }
-
-  GITHUB_REPO_NAME=$(echo "$json" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
-  GITHUB_OWNER=$(echo "$json" | grep -o '"login":"[^"]*"' | cut -d'"' -f4)
-  GITHUB_DESCRIPTION=$(echo "$json" | grep -o '"description":"[^"]*"' | cut -d'"' -f4 || echo "")
-  GITHUB_VISIBILITY=$(echo "$json" | grep -o '"visibility":"[^"]*"' | cut -d'"' -f4 | tr '[:upper:]' '[:lower:]')
-  GITHUB_DEFAULT_BRANCH=$(echo "$json" | grep -o '"defaultBranchRef":{[^}]*"name":"[^"]*"' | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+  GITHUB_OWNER=$(gh repo view --json owner -q '.owner.login' 2>/dev/null) || GITHUB_OWNER=""
+  GITHUB_DESCRIPTION=$(gh repo view --json description -q '.description // ""' 2>/dev/null) || GITHUB_DESCRIPTION=""
+  GITHUB_VISIBILITY=$(gh repo view --json visibility -q '.visibility' 2>/dev/null | tr '[:upper:]' '[:lower:]') || GITHUB_VISIBILITY="private"
+  GITHUB_DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null) || GITHUB_DEFAULT_BRANCH="main"
 
   # Map GitHub visibility to GitLab
   case "$GITHUB_VISIBILITY" in
@@ -180,8 +195,17 @@ run_gitlab_setup() {
 
 run_workflow() {
   echo "=== GitHub Actions workflow setup ==="
-  # Pass GITLAB_REPO so workflow script doesn't ask again
-  local repo="${GITLAB_REPO:-${GITLAB_HOST}/${GITLAB_NAMESPACE:-$GITHUB_OWNER}/${GITHUB_REPO_NAME}.git}"
+
+  # Try to get GITLAB_REPO from GitHub variable if not already set
+  local repo="${GITLAB_REPO:-}"
+  if [[ -z "$repo" ]]; then
+    repo=$(gh variable get GITLAB_REPO 2>/dev/null) || repo=""
+  fi
+  # Fall back to computed value only if still empty
+  if [[ -z "$repo" ]]; then
+    repo="${GITLAB_HOST}/${GITLAB_NAMESPACE:-$GITHUB_OWNER}/${GITHUB_REPO_NAME}.git"
+  fi
+
   if [[ "$AUTO_MODE" == "true" ]]; then
     AUTO_MODE=true FEATURE_POLICY=always GITLAB_REPO="$repo" \
       bash "$WORKFLOW_SCRIPT" --auto
@@ -193,10 +217,20 @@ run_workflow() {
 run_initial_mirror() {
   echo "=== Initial full mirror to GitLab ==="
 
-  local gitlab_repo="${GITLAB_HOST}/${GITLAB_NAMESPACE:-$GITHUB_OWNER}/${GITHUB_REPO_NAME}.git"
+  # Get GITLAB_REPO from GitHub variable if not set
+  local gitlab_repo="${GITLAB_REPO:-}"
+  if [[ -z "$gitlab_repo" ]]; then
+    gitlab_repo=$(gh variable get GITLAB_REPO 2>/dev/null) || gitlab_repo=""
+  fi
+  if [[ -z "$gitlab_repo" ]]; then
+    gitlab_repo="${GITLAB_HOST}/${GITLAB_NAMESPACE:-$GITHUB_OWNER}/${GITHUB_REPO_NAME}.git"
+  fi
 
+  # Try keychain first, then prompt
   if [[ -z "$GITLAB_TOKEN" ]]; then
-    # Try to get from gh secrets (won't work, but try)
+    load_token_from_keychain
+  fi
+  if [[ -z "$GITLAB_TOKEN" ]]; then
     read -r -s -p "Enter GitLab token for initial push: " GITLAB_TOKEN
     echo
   fi
@@ -305,6 +339,7 @@ main() {
       ensure_git_repo
       ensure_gh_cli
       get_github_info
+      load_token_from_keychain
 
       echo "GitHub repo: ${GITHUB_OWNER}/${GITHUB_REPO_NAME}"
       echo "Default branch: ${GITHUB_DEFAULT_BRANCH}"

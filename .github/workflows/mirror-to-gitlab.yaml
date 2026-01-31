@@ -1,0 +1,118 @@
+# Mirror to GitLab workflow (generated via scripts/setup-gha.sh)
+# Options:
+#   - Default branch pushes: ALWAYS mirror (force overwrite keeps GitLab in sync with main).
+#   - Non-default branch pushes (PR commits): mirror immediately like default branch pushes (no keyword required).
+#   - Opt-in keyword disabled (all feature pushes mirror automatically).
+#   - Target GitLab repo: gitlab.com/Santeau/gh-to-gl-migrator.git
+#   - Re-run scripts/setup-gha.sh to update keyword/policy after changing expectations.
+name: Mirror to GitLab (ALWAYS overwrite default)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Ensure only one mirror job runs per branch ref at a time; avoids concurrent force-push races.
+  group: mirror-to-gitlab-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Canonical branch resolved from the GitHub repository (e.g., main/master). Always mirrored.
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+  # Policy set by setup script.  mirrors every feature/PR push;  mirrors only when the keyword is present.
+  FEATURE_PUSH_POLICY: "always"
+  # Commit-message keyword required when FEATURE_PUSH_POLICY == 'keyword'. Empty when policy == 'always'.
+  OVERRIDE_KEYWORD: ""
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # Gate: allow manual runs, always run for default-branch pushes, and conditionally mirror feature branches per policy.
+    if: >
+      github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+
+    steps:
+      # Fetch entire history and tags so force pushes mirror the complete state.
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Configure Git identity and trust the workspace before interacting with remotes.
+      - name: Configure git
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --prune --tags origin
+
+      # Add/update GitLab remote using PAT + repository URL from workflow variables.
+      - name: Add GitLab remote
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_REPO:  ${{ vars.GITLAB_REPO }}
+        run: |
+          test -n "$GITLAB_TOKEN" || { echo "Missing secret GITLAB_TOKEN"; exit 1; }
+          test -n "$GITLAB_REPO"  || { echo "Missing var GITLAB_REPO (gitlab.com/<ns>/<repo>.git)"; exit 1; }
+          git remote remove gitlab 2>/dev/null || true
+          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO}"
+          git remote -v
+
+      # Discover GitLab's default branch to ensure we overwrite the correct branch.
+      - name: Detect GitLab default branch & fetch it
+        id: rem
+        run: |
+          set -euo pipefail
+          git fetch --prune --tags gitlab
+          REMOTE_HEAD=$(git ls-remote --symref gitlab HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##' || true)
+          if [ -z "$REMOTE_HEAD" ]; then REMOTE_HEAD="${DEFAULT_BRANCH}"; fi
+          echo "remote_head=$REMOTE_HEAD" >> "$GITHUB_OUTPUT"
+          echo "GitLab default branch is: $REMOTE_HEAD"
+
+      # Force sync the GitLab default branch with the GitHub default branch.
+      - name: FORCE overwrite GitLab default from GitHub default
+        env:
+          REMOTE_HEAD: ${{ steps.rem.outputs.remote_head }}
+          DEFAULT_BRANCH: ${{ env.DEFAULT_BRANCH }}
+        run: |
+          set -euo pipefail
+          echo "Overwriting gitlab:$REMOTE_HEAD from origin/$DEFAULT_BRANCH (HARD FORCE)"
+          echo "(Ensure GitLab Protected Branch allows Force push — you already enabled it.)"
+          git push --force gitlab "refs/remotes/origin/${DEFAULT_BRANCH}:refs/heads/${REMOTE_HEAD}"
+
+      # If this push is on a non-default branch (feature/PR branch), mirror that branch too.
+      - name: FORCE push current branch (if not default)
+        env:
+          DEFAULT_BRANCH: ${{ env.DEFAULT_BRANCH }}
+        run: |
+          set -euo pipefail
+          CURRENT_BRANCH="${GITHUB_REF#refs/heads/}"
+          if [[ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]]; then
+            echo "Mirroring feature branch: $CURRENT_BRANCH"
+            git push --force gitlab "refs/remotes/origin/${CURRENT_BRANCH}:refs/heads/${CURRENT_BRANCH}"
+          else
+            echo "Current branch is default branch; already mirrored above."
+          fi
+
+      # Keep release tags in sync by force pushing them as well.
+      - name: FORCE push tags
+        run: git push --force --tags gitlab
+
+      # Optional cleanup: delete stale branches on GitLab to avoid MR noise when PRUNE_REMOTE is true.
+      - name: OPTIONAL prune all remote branches except default
+        if: ${{ vars.PRUNE_REMOTE == 'true' }}
+        env:
+          REMOTE_HEAD: ${{ steps.rem.outputs.remote_head }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t REMOTE < <(git ls-remote --heads gitlab | awk '{print $2}' | sed 's#refs/heads/##' || true)
+          for rb in "${REMOTE[@]}"; do
+            [[ "$rb" == "$REMOTE_HEAD" ]] && continue
+            echo "Deleting remote branch $rb on GitLab"
+            git push gitlab --delete "$rb" || true
+          done
