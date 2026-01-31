@@ -5,6 +5,7 @@ set -euo pipefail
 AUTO_MODE="${AUTO_MODE:-false}"
 GITLAB_TOKEN="${GITLAB_TOKEN:-}"
 GITLAB_REPO="${GITLAB_REPO:-}"
+GITLAB_HOST="${GITLAB_HOST:-gitlab.com}"
 
 # Parse --auto flag
 for arg in "$@"; do
@@ -12,6 +13,24 @@ for arg in "$@"; do
     --auto|-y) AUTO_MODE=true ;;
   esac
 done
+
+# Source keychain helpers if available
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/keychain.sh" ]]; then
+  source "$SCRIPT_DIR/keychain.sh"
+fi
+
+# Try to load token from keychain
+load_token_from_keychain() {
+  if [[ -z "$GITLAB_TOKEN" ]] && type keychain_get &>/dev/null; then
+    local stored_token
+    if stored_token="$(keychain_get "$GITLAB_HOST" 2>/dev/null)" && [[ -n "$stored_token" ]]; then
+      GITLAB_TOKEN="$stored_token"
+      return 0
+    fi
+  fi
+  return 1
+}
 
 ask_yes_no() {
   local prompt="$1" response lowered
@@ -122,6 +141,10 @@ main() {
 
   # Set GitLab token secret
   if [[ "$AUTO_MODE" == "true" ]]; then
+    # Try keychain first
+    if [[ -z "$GITLAB_TOKEN" ]]; then
+      load_token_from_keychain && echo "Using GitLab token from keychain"
+    fi
     if [[ -n "$GITLAB_TOKEN" ]]; then
       echo "Setting GITLAB_TOKEN secret..."
       gh secret set GITLAB_TOKEN "${scope_args[@]}" --app actions --body "$GITLAB_TOKEN"
@@ -129,23 +152,64 @@ main() {
     else
       echo "Warning: GITLAB_TOKEN not provided, skipping secret setup."
     fi
-  elif ask_yes_no "Add PAT secret for GitLab"; then
-    local pat
-    while true; do
-      read -r -s -p "Enter GitLab PAT (input hidden): " pat
-      echo
-      pat="$(trim "$pat")"
-      if [[ -z "$pat" ]]; then
-        echo "PAT cannot be empty."
-        continue
+  else
+    local pat="" use_keychain_token=false setup_pat=true
+
+    # Check if we have a token in keychain first
+    if load_token_from_keychain; then
+      echo "Found GitLab token in keychain."
+      if ask_yes_no "Use saved token"; then
+        pat="$GITLAB_TOKEN"
+        use_keychain_token=true
       fi
+    fi
+
+    if [[ "$use_keychain_token" != "true" ]]; then
+      # Ask if user has a PAT
+      if ask_yes_no "Do you have a GitLab Personal Access Token (PAT)"; then
+        : # User has one, continue to prompt
+      else
+        echo
+        echo "To create a GitLab PAT:"
+        echo "  1. Go to: https://${GITLAB_HOST}/-/user_settings/personal_access_tokens"
+        echo "  2. Click 'Add new token'"
+        echo "  3. Name: ghmirror (or any name)"
+        echo "  4. Scopes: select 'api' and 'write_repository'"
+        echo "  5. Click 'Create personal access token'"
+        echo "  6. Copy the token (you won't see it again)"
+        echo
+        if ! ask_yes_no "Continue after creating PAT"; then
+          echo "Skipping PAT setup. Run 'ghmirror configure' when ready."
+          setup_pat=false
+        fi
+      fi
+
+      if [[ "$setup_pat" == "true" ]]; then
+        while true; do
+          read -r -s -p "Enter GitLab PAT (input hidden): " pat
+          echo
+          pat="$(trim "$pat")"
+          if [[ -z "$pat" ]]; then
+            echo "PAT cannot be empty."
+            continue
+          fi
+          break
+        done
+
+        # Offer to save to keychain
+        if type keychain_store &>/dev/null; then
+          if ask_yes_no "Save token to keychain for future use"; then
+            keychain_store "$pat" "$GITLAB_HOST"
+          fi
+        fi
+      fi
+    fi
+
+    if [[ -n "$pat" ]]; then
       gh secret set GITLAB_TOKEN "${scope_args[@]}" --app actions --body "$pat"
       unset pat
       echo "Secret GITLAB_TOKEN configured."
-      break
-    done
-  else
-    echo "Skipping PAT secret."
+    fi
   fi
 
   # Set GitLab repository variable

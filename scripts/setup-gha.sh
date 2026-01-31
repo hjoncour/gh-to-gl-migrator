@@ -316,9 +316,9 @@ concurrency:
 env:
   # Canonical branch resolved from the GitHub repository (e.g., main/master). Always mirrored.
   DEFAULT_BRANCH: \${{ github.event.repository.default_branch }}
-  # Policy set by setup script. `always` mirrors every feature/PR push; `keyword` mirrors only when the keyword is present.
+  # Policy set by setup script. "always" mirrors every feature/PR push; "keyword" mirrors only when the keyword is present.
   FEATURE_PUSH_POLICY: "${feature_policy}"
-  # Commit-message keyword required when FEATURE_PUSH_POLICY == 'keyword'. Empty when policy == 'always'.
+  # Commit-message keyword required when FEATURE_PUSH_POLICY == "keyword". Empty when policy == "always".
   OVERRIDE_KEYWORD: ${yaml_keyword}
 
 jobs:
